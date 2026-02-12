@@ -31,6 +31,7 @@ from src.answer_agent import build_answer, combine_answers, show_answer
 from src.critic_agent import evaluate, show_eval
 from src.revision_agent import run_revision_loop, show_revision
 from src.memory import Memory
+from src.utils import clean_author_output
 
 
 def setup_pipeline(pdf_path):
@@ -123,20 +124,29 @@ def answer_query(query, pipe):
     print("\n[2] RETRIEVAL")
     all_found = []
     all_contexts = []
+    retrieval_info = None
 
     for subtask in plan["subtasks"]:
         # pull out the actual search text from "Subtask N: ..."
         search_q = subtask.split(":", 1)[-1].strip()
         print(f"\n  Searching: {search_q}")
         
-        found = find_top_chunks(search_q, idx, chunks, model, top_k=3)
-        show_results(found)
+        found, r_info = find_top_chunks(search_q, idx, chunks, model, top_k=3)
+        show_results(found, r_info)
+        
+        # keep the retrieval info from the main query (first subtask)
+        if retrieval_info is None:
+            retrieval_info = r_info
         
         all_found.extend(found)
         ctx = build_context(found)
         all_contexts.append(ctx)
 
     full_context = "\n\n".join(all_contexts)
+
+    # warn if retrieval confidence is low
+    if retrieval_info and retrieval_info.get("low_confidence"):
+        print("\n  ⚠ LOW CONFIDENCE RETRIEVAL - chunks may not be relevant")
 
     # -- step 3: generate answer --
     print("\n[3] ANSWER AGENT")
@@ -160,7 +170,7 @@ def answer_query(query, pipe):
 
     # -- step 4: critique --
     print("\n[4] CRITIC")
-    ev = evaluate(first_answer, full_context, query)
+    ev = evaluate(first_answer, full_context, query, retrieval_confidence=retrieval_info)
     show_eval(ev)
 
     # -- step 5: revise if needed --
@@ -169,7 +179,7 @@ def answer_query(query, pipe):
 
     if ev["needs_revision"]:
         print("\n[5] REVISION")
-        rev_result = run_revision_loop(first_answer, full_context, query, evaluate)
+        rev_result = run_revision_loop(first_answer, full_context, query, evaluate, retrieval_info=retrieval_info)
         final = rev_result["final_answer"]
         show_revision(rev_result)
     else:
@@ -188,12 +198,17 @@ def answer_query(query, pipe):
         revisions=rev_result["rounds"] if rev_result else 0,
     )
 
+    # -- clean up author output if needed --
+    if retrieval_info and retrieval_info["intent"]["intent"] == "author":
+        final = clean_author_output(final)
+
     # -- final output --
     output = {
         "query": query,
         "complexity": complexity,
         "plan": plan,
         "found": all_found,
+        "retrieval_info": retrieval_info,
         "first_answer": first_answer,
         "evaluation": ev,
         "revision": rev_result,
@@ -210,13 +225,28 @@ def print_output(out):
     print("FINAL OUTPUT")
     print("=" * 50)
 
-    print(f"\nQuery: {out['query']}")
-    c = out['complexity']
-    print(f"Complexity: {'Complex' if c['is_complex'] else 'Simple'} - {c['reason']}")
+    print(f"\nUser Query: {out['query']}")
+    print(f"Subtasks: {', '.join(out['plan']['subtasks'])}")
+    
+    if out["found"]:
+        top_score = out["found"][0]["score"]
+        print(f"Top Similarity Score: {top_score:.4f}")
+    
+    print(f"\nInitial Answer:\n{out['first_answer']}")
+    
+    ev = out["evaluation"]
+    print(f"\nCritic Score: {ev['score']}/10")
+    print(f"  - Relevance: {ev.get('relevance', '?')}")
+    print(f"  - Grounding: {ev.get('grounding', '?')}")
+    print(f"  - Metadata Noise: {ev.get('has_noise', False)}")
+    
+    if out["revision"]:
+        print(f"\nRevised Answer ({out['revision']['rounds']} rounds):\n{out['final_answer']}")
+    else:
+        print(f"\nFinal Answer:\n{out['final_answer']}")
 
-    print(f"\nSubtasks:")
-    for t in out["plan"]["subtasks"]:
-        print(f"  - {t}")
+    print("\n" + "=" * 50)
+
 
     print(f"\nRetrieved chunks:")
     for r in out["found"]:

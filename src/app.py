@@ -119,19 +119,29 @@ else:
         with st.expander("🔍 Step 2: Retrieval", expanded=True):
             all_found = []
             all_ctx = []
+            retrieval_info = None
 
             for subtask in plan["subtasks"]:
                 sq = subtask.split(":", 1)[-1].strip()
-                found = find_top_chunks(sq, pipe["index"], pipe["chunks"],
+                found, r_info = find_top_chunks(sq, pipe["index"], pipe["chunks"],
                                        pipe["model"], top_k=3)
                 all_found.extend(found)
                 all_ctx.append(build_context(found))
+                if retrieval_info is None:
+                    retrieval_info = r_info
 
             full_ctx = "\n\n".join(all_ctx)
 
+            # show retrieval info
+            if retrieval_info:
+                st.markdown(f"**Query Intent:** {retrieval_info['intent']['intent']}")
+                if retrieval_info.get('low_confidence'):
+                    st.warning("⚠️ Low confidence retrieval - chunks may not be relevant")
+
             for r in all_found:
                 w = f" ⚠️ {r['warning']}" if "warning" in r else ""
-                st.markdown(f"**Rank {r['rank']}** (dist: {r['score']:.4f}){w}")
+                ref = " 📚 [REF]" if r.get("is_reference_chunk") else ""
+                st.markdown(f"**Rank {r['rank']}** (dist: {r['score']:.4f}){w}{ref}")
                 st.text(r["chunk"]["text"][:200] + "...")
                 st.divider()
 
@@ -156,27 +166,39 @@ else:
         # critic
         with st.expander("🔎 Step 4: Critic", expanded=True):
             with st.spinner("Evaluating..."):
-                ev = evaluate(first_answer, full_ctx, query)
+                ev = evaluate(first_answer, full_ctx, query, retrieval_confidence=retrieval_info)
 
             color = "green" if ev["score"] >= 7 else "orange" if ev["score"] >= 4 else "red"
             st.markdown(f"**Score:** :{color}[{ev['score']}/10]")
+            st.markdown(f"**Relevance:** {ev.get('relevance', '?')}")
+            st.markdown(f"**Grounding:** {ev.get('grounding', '?')}")
             st.markdown(f"**Needs revision:** {ev['needs_revision']}")
-            st.text(ev["feedback"])
 
         # revision
         with st.expander("✏️ Step 5: Revision", expanded=True):
+            final = first_answer
+            rev = None
+            
             if ev["needs_revision"]:
                 with st.spinner("Revising..."):
-                    rev = run_revision_loop(first_answer, full_ctx, query, evaluate)
+                    rev = run_revision_loop(first_answer, full_ctx, query, evaluate, retrieval_info=retrieval_info)
                     final = rev["final_answer"]
 
                 st.markdown(f"**Rounds:** {rev['rounds']}")
-                st.markdown(f"**Score:** {rev['score_before']} → {rev['score_after']}")
-                st.markdown(f"**Revised:** {final}")
+                st.markdown(f"**Score:** {rev['score_before']} ➡️ {rev['score_after']}")
+                if rev['got_better']:
+                    st.success("Score improved!")
+                else:
+                    st.info("Score didn't improve.")
+                    
+                st.text(final)
             else:
-                final = first_answer
-                rev = None
-                st.markdown("Score is fine, no revision needed.")
+                st.info("Score is fine, no revision needed.")
+
+        # cleanup author output if needed
+        from src.utils import clean_author_output
+        if retrieval_info and retrieval_info["intent"]["intent"] == "author":
+            final = clean_author_output(final)
 
         # final answer
         st.divider()
